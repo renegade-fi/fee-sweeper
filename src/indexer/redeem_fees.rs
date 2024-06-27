@@ -6,7 +6,9 @@ use std::str::FromStr;
 use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use ethers::core::rand::thread_rng;
 use ethers::signers::LocalWallet;
+use ethers::types::TxHash;
 use ethers::utils::hex;
+use renegade_api::http::wallet::RedeemNoteRequest;
 use renegade_common::types::wallet::derivation::{
     derive_blinder_seed, derive_share_seed, derive_wallet_id, derive_wallet_keychain,
 };
@@ -45,11 +47,17 @@ impl Indexer {
         // TODO: Filter by those fees whose present value exceeds the expected gas costs to redeem
         for fee in most_valuable_fees.into_iter() {
             let wallet = self.get_or_create_wallet(&fee.mint).await?;
-            info!("redeeming into {}", wallet.id);
+            self.redeem_note_into_wallet(fee.tx_hash.clone(), wallet)
+                .await?;
+            info!("successfully redeemed fee from tx: {}", fee.tx_hash);
         }
 
         Ok(())
     }
+
+    // -------------------
+    // | Wallet Creation |
+    // -------------------
 
     /// Find or create a wallet to store balances of a given mint
     async fn get_or_create_wallet(&mut self, mint: &str) -> Result<WalletMetadata, String> {
@@ -87,17 +95,12 @@ impl Indexer {
 
     /// Create a new Renegade wallet on-chain
     async fn create_renegade_wallet(&mut self) -> Result<(WalletIdentifier, LocalWallet), String> {
-        let chain_id = self
-            .arbitrum_client
-            .chain_id()
-            .await
-            .map_err(raw_err_str!("Error fetching chain ID: {}"))?;
         let root_key = LocalWallet::new(&mut thread_rng());
 
         let wallet_id = derive_wallet_id(&root_key)?;
         let blinder_seed = derive_blinder_seed(&root_key)?;
         let share_seed = derive_share_seed(&root_key)?;
-        let key_chain = derive_wallet_keychain(&root_key, chain_id)?;
+        let key_chain = derive_wallet_keychain(&root_key, self.chain_id)?;
 
         let wallet = Wallet::new_empty_wallet(wallet_id, blinder_seed, share_seed, key_chain);
         self.relayer_client.create_new_wallet(wallet).await?;
@@ -105,6 +108,44 @@ impl Indexer {
 
         Ok((wallet_id, root_key))
     }
+
+    // ------------------
+    // | Fee Redemption |
+    // ------------------
+
+    /// Redeem a noe into a wallet
+    pub async fn redeem_note_into_wallet(
+        &mut self,
+        tx: String,
+        wallet: WalletMetadata,
+    ) -> Result<(), String> {
+        info!("redeeming fee into {}", wallet.id);
+        // Get the wallet key for the given wallet
+        let eth_key = self.get_wallet_private_key(&wallet).await?;
+        let wallet_keychain = derive_wallet_keychain(&eth_key, self.chain_id).unwrap();
+        let root_key = wallet_keychain.secret_keys.sk_root.clone().unwrap();
+
+        self.relayer_client
+            .check_wallet_indexed(wallet.id, self.chain_id, &eth_key)
+            .await?;
+
+        // Find the note in the tx body
+        let tx_hash = TxHash::from_str(&tx).map_err(raw_err_str!("invalid tx hash: {}"))?;
+        let note = self.get_note_from_tx(tx_hash).await?;
+
+        // Redeem the note through the relayer
+        let req = RedeemNoteRequest {
+            note,
+            decryption_key: self.decryption_key,
+        };
+        self.relayer_client
+            .redeem_note(wallet.id, req, &root_key)
+            .await
+    }
+
+    // -------------------
+    // | Secrets Manager |
+    // -------------------
 
     /// Add a Renegade wallet to the secrets manager entry so that it may be recovered later
     ///
@@ -115,7 +156,7 @@ impl Indexer {
         wallet: LocalWallet,
     ) -> Result<String, String> {
         let client = SecretsManagerClient::new(&self.aws_config);
-        let secret_name = format!("redemption-wallet-{}-{id}", self.env);
+        let secret_name = format!("redemption-wallet-{}-{id}", self.chain);
         let secret_val = hex::encode(wallet.signer().to_bytes());
 
         // Check that the `LocalWallet` recovers the same
@@ -132,5 +173,26 @@ impl Indexer {
             .map_err(raw_err_str!("Error creating secret: {}"))?;
 
         Ok(secret_name)
+    }
+
+    /// Get the private key for a wallet specified by its metadata
+    async fn get_wallet_private_key(
+        &mut self,
+        metadata: &WalletMetadata,
+    ) -> Result<LocalWallet, String> {
+        let client = SecretsManagerClient::new(&self.aws_config);
+        let secret_name = format!("redemption-wallet-{}-{}", self.chain, metadata.id);
+
+        let secret = client
+            .get_secret_value()
+            .secret_id(secret_name)
+            .send()
+            .await
+            .map_err(raw_err_str!("Error fetching secret: {}"))?;
+
+        let secret_str = secret.secret_string().unwrap();
+        let wallet =
+            LocalWallet::from_str(secret_str).map_err(raw_err_str!("Invalid wallet secret: {}"))?;
+        Ok(wallet)
     }
 }

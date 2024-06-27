@@ -56,6 +56,7 @@ pub(crate) struct FeeValue {
     pub mint: String,
     /// The value of the fee
     #[sql_type = "Numeric"]
+    #[allow(unused)]
     pub value: BigDecimal,
 }
 
