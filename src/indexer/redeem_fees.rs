@@ -9,10 +9,12 @@ use ethers::signers::LocalWallet;
 use ethers::types::TxHash;
 use ethers::utils::hex;
 use renegade_api::http::wallet::RedeemNoteRequest;
+use renegade_circuit_types::note::Note;
 use renegade_common::types::wallet::derivation::{
     derive_blinder_seed, derive_share_seed, derive_wallet_id, derive_wallet_keychain,
 };
 use renegade_common::types::wallet::{Wallet, WalletIdentifier};
+use renegade_util::hex::jubjub_to_hex_string;
 use renegade_util::raw_err_str;
 use tracing::{info, warn};
 
@@ -42,14 +44,14 @@ impl Indexer {
         }
 
         // Get the most valuable fees and redeem them
-        let most_valuable_fees = self.get_most_valuable_fees(prices)?;
+        let recv = jubjub_to_hex_string(&self.decryption_key.public_key());
+        let most_valuable_fees = self.get_most_valuable_fees(prices, &recv)?;
 
         // TODO: Filter by those fees whose present value exceeds the expected gas costs to redeem
         for fee in most_valuable_fees.into_iter() {
             let wallet = self.get_or_create_wallet(&fee.mint).await?;
             self.redeem_note_into_wallet(fee.tx_hash.clone(), wallet)
                 .await?;
-            info!("successfully redeemed fee from tx: {}", fee.tx_hash);
         }
 
         Ok(())
@@ -113,12 +115,12 @@ impl Indexer {
     // | Fee Redemption |
     // ------------------
 
-    /// Redeem a noe into a wallet
+    /// Redeem a note into a wallet
     pub async fn redeem_note_into_wallet(
         &mut self,
         tx: String,
         wallet: WalletMetadata,
-    ) -> Result<(), String> {
+    ) -> Result<Note, String> {
         info!("redeeming fee into {}", wallet.id);
         // Get the wallet key for the given wallet
         let eth_key = self.get_wallet_private_key(&wallet).await?;
@@ -135,12 +137,32 @@ impl Indexer {
 
         // Redeem the note through the relayer
         let req = RedeemNoteRequest {
-            note,
+            note: note.clone(),
             decryption_key: self.decryption_key,
         };
         self.relayer_client
             .redeem_note(wallet.id, req, &root_key)
+            .await?;
+
+        // Mark the fee as redeemed
+        self.maybe_mark_redeemed(&tx, &note).await?;
+        Ok(note)
+    }
+
+    /// Mark a fee as redeemed if its nullifier is spent on-chain
+    async fn maybe_mark_redeemed(&mut self, tx_hash: &str, note: &Note) -> Result<(), String> {
+        let nullifier = note.nullifier();
+        if !self
+            .arbitrum_client
+            .check_nullifier_used(nullifier)
             .await
+            .map_err(raw_err_str!("failed to check nullifier: {}"))?
+        {
+            return Ok(());
+        }
+
+        info!("successfully redeemed fee from tx: {}", tx_hash);
+        self.mark_fee_as_redeemed(tx_hash)
     }
 
     // -------------------
